@@ -3,7 +3,7 @@
 #                                                                       #
 #########################################################################
 
-$DBRepairVersion = 'v1.02.02'
+$DBRepairVersion = 'v1.02.03'
 
 class DBRepair {
     [DBRepairOptions] $Options
@@ -37,9 +37,14 @@ class DBRepair {
     [bool]   $CheckedFTS # Whether the FTS indexes have been checked this session
     [bool]   $FTSDamaged # Whether the last FTS check found damage
 
-    DBRepair($Arguments, $Version) {
+    [string] $ScriptPath # Full path to this script (for self-update); may be empty
+    [int]    $PageSize   # Resolved DBREPAIR_PAGESIZE value (0 = unset/invalid)
+    [bool]   $PageSizeResolved # Whether GetPageSize has parsed the environment yet
+
+    DBRepair($Arguments, $Version, $ScriptPath) {
         $this.Options = [DBRepairOptions]::new()
         $this.Version = $Version
+        $this.ScriptPath = $ScriptPath
         $this.IsError = $false
         $this.SetLast("", "")
         $Commands = $this.PreprocessArgs($Arguments)
@@ -83,6 +88,11 @@ class DBRepair {
         Write-Host " -CacheAge [int]  - The date cutoff for pruned images. Defaults to pruning images over 30"
         Write-Host "                    days old."
         Write-Host
+        Write-Host "Environment variables"
+        Write-Host
+        Write-Host " DBREPAIR_PAGESIZE - Page size (bytes) for rebuilt databases. A power of two from 1024 to"
+        Write-Host "                     65536. Applied during repair and import."
+        Write-Host
     }
 
     [void] PrintMenu() {
@@ -104,6 +114,7 @@ class DBRepair {
         Write-Host
         Write-Host "  7 - 'start'     - Start PMS"
         Write-Host
+        Write-Host "  8 - 'import'    - Import watch history from another database (interactive, risky)."
         Write-Host "  9 - 'replace'   - Replace current databases with a saved backup (interactive)."
         Write-Host " 10 - 'show'      - Show logfile."
         Write-Host " 11 - 'status'    - Report status of PMS (run-state and databases)."
@@ -117,6 +128,7 @@ class DBRepair {
             Write-Host " 42 - 'ignore'    - Ignore duplicate/constraint errors."
         }
         Write-Host
+        Write-Host " 88 - 'update'    - Check for and install a newer version of this script."
         Write-Host " 98 - 'quit'      - Quit immediately.  Keep all temporary files."
         Write-Host " 99   'exit'      - Exit with cleanup options."
         Write-Host
@@ -242,6 +254,10 @@ class DBRepair {
                     $this.IsError = !$this.DoReindex()
                 }
                 "^(7|start?)$" { $this.StartPMS() }
+                "^(8|impo(r(t)?)?)$" {
+                    $this.SetStage("Import")
+                    $this.DoImport() | Out-Null
+                }
                 "^(9|repl(a(c(e)?)?)?)$" {
                     $this.SetStage("Replace")
                     $this.DoReplace()
@@ -259,6 +275,10 @@ class DBRepair {
                 "^(23|defl(a(t(e)?)?)?)$" {
                     $this.SetStage("Deflate")
                     $this.IsError = !$this.DoDeflate()
+                }
+                "^(88|upda(t(e)?)?)$" {
+                    $this.SetStage("Update")
+                    $this.DoUpdate()
                 }
                 "^(42|ignor?e?|honor?)$" {
                     if (($this.Options.IgnoreErrors -and ($Choice[0] -eq 'i')) -or (!$this.Options.IgnoreErrors -and ($Choice[0] -eq 'h'))) {
@@ -466,13 +486,15 @@ class DBRepair {
         # Make sure Plex hasn't been started while we were exporting
         if (!$this.CheckPMS("export")) { return $false }
 
-        # Import into fresh databases (scratch copies in dbtmp)
+        # Import into fresh databases (scratch copies in dbtmp), honoring DBREPAIR_PAGESIZE if set
         $this.Output("Importing Main DB.")
         $MainDBImport = Join-Path $DBTemp -ChildPath "$($this.MainDB)-REPAIR-$($this.Timestamp)"
+        $this.ApplyPageSize($MainDBImport)
         if (!$this.ImportPlexDB($MainDBSQL, $MainDBImport)) { return $false }
 
         $this.Output("Importing Blobs DB.")
         $BlobsDBImport = Join-Path $DBTemp -ChildPath "$($this.BlobsDB)-REPAIR-$($this.Timestamp)"
+        $this.ApplyPageSize($BlobsDBImport)
         if (!$this.ImportPlexDB($BlobsDBSQL, $BlobsDBImport)) { return $false }
 
         $this.Output("Successfully imported databases.")
@@ -1148,6 +1170,289 @@ COMMIT;
             }
         }
         $this.WriteOutputLog($this.StageLog("Removed $Removed PMS transcode temp file(s)"))
+    }
+
+    ### Page size (DBREPAIR_PAGESIZE) ###
+
+    # Resolve and cache the desired SQLite page size from the DBREPAIR_PAGESIZE environment variable.
+    # Returns 0 when unset/invalid. Normalizes to a power of two between 1024 and 65536 (warns once).
+    [int] GetPageSize() {
+        if ($this.PageSizeResolved) { return $this.PageSize }
+        $this.PageSizeResolved = $true
+        $this.PageSize = 0
+
+        $Raw = $env:DBREPAIR_PAGESIZE
+        if (!$Raw) { return 0 }
+
+        if ($Raw -notmatch '^\d+$') {
+            $this.WriteOutputLogWarn("DBREPAIR_PAGESIZE is not a valid integer. Ignoring '$Raw'")
+            return 0
+        }
+
+        $Size = [int]$Raw
+        if ($Size -le 0) { return 0 }
+
+        if (($Size % 1024) -ne 0) {
+            $Rounded = [int]([math]::Ceiling($Size / 1024) * 1024)
+            $this.WriteOutputLogWarn("DBREPAIR_PAGESIZE ($Size) is not a multiple of 1024. Using $Rounded.")
+            $Size = $Rounded
+        }
+
+        if ($Size -gt 65536) {
+            $this.WriteOutputLogWarn("DBREPAIR_PAGESIZE ($Size) too large. Reducing to 65536.")
+            $Size = 65536
+        }
+
+        $Valid = @(1024, 2048, 4096, 8192, 16384, 32768, 65536)
+        if ($Size -notin $Valid) {
+            foreach ($v in $Valid) {
+                if ($v -gt $Size) {
+                    $this.WriteOutputLogWarn("DBREPAIR_PAGESIZE ($Size) is not a power of 2. Using $v.")
+                    $Size = $v
+                    break
+                }
+            }
+        }
+
+        $this.PageSize = $Size
+        return $Size
+    }
+
+    # Create/initialize the given database file with the configured page size (no-op if unset).
+    [void] ApplyPageSize([string] $DBPath) {
+        $Size = $this.GetPageSize()
+        if ($Size -le 0) { return }
+        $this.Output("Setting Plex SQLite page size ($Size)")
+        $this.WriteLog($this.StageLog("SetPageSize - page_size: $Size"))
+        $this.RunSQLCommand("""$DBPath"" ""PRAGMA page_size=$Size; VACUUM;""", "Failed to set page size on $DBPath") | Out-Null
+    }
+
+    ### Import watch history (mirrors DBRepair.sh DoImport) ###
+
+    # Import watch history / viewstate from another Plex database (interactive 'import' command).
+    [bool] DoImport() {
+        $this.Output("Import watch history started.")
+        $this.WriteLog($this.StageLog("START"))
+
+        if (!$this.CheckPMS("import")) { return $false }
+
+        if ($this.Options.Scripted) {
+            $this.OutputWarn("'import' requires an interactive source path and cannot run in scripted mode.")
+            $this.WriteLog($this.StageLog("Skipped - scripted mode"))
+            return $false
+        }
+
+        if (!$this.FreeSpaceAvailable(3)) {
+            $this.OutputWarn("Insufficient free space to import (need $($this.SpaceNeeded) MB, have $($this.SpaceAvailable) MB).")
+            $this.WriteLog($this.StageLog("FAIL - Insufficient free space"))
+            return $false
+        }
+
+        $Source = Read-Host "Pathname of database containing watch history to import (blank = cancel)"
+        if (!$Source) { return $false }
+        if (!$this.FileExists($Source)) {
+            $this.OutputWarn("'$Source' does not exist.")
+            return $false
+        }
+
+        $this.WriteLog($this.StageLog("Attempting to import watch history from '$Source'"))
+
+        # Our databases must be healthy before we merge anything in
+        if (!$this.CheckDatabases($true)) {
+            $this.OutputWarn("PMS databases are damaged. Repair needed. Refusing to import.")
+            $this.WriteLog($this.StageLog("Verify main database - FAIL"))
+            return $false
+        }
+
+        $this.Output("Checking database '$Source'")
+        if (!$this.CheckDBIntegrity($Source, "source")) {
+            $this.OutputWarn("Given database '$Source' is damaged. Database not trusted. Refusing to import.")
+            $this.WriteLog($this.StageLog("Verify '$Source' - FAIL"))
+            return $false
+        }
+
+        $DBTemp = $this.EnsureDBTemp()
+        if (!$DBTemp) { return $false }
+
+        if (!$this.MakeBackups()) {
+            $this.WriteLog($this.StageLog("MakeBackups - FAIL"))
+            return $false
+        }
+        $this.WriteLog($this.StageLog("MakeBackups - PASS"))
+
+        # Export the viewstate/history tables from the source, dropping the schema (CREATE) lines so
+        # the rows merge into our existing tables
+        $this.Output("Exporting Viewstate & Watch history")
+        $RawDump = Join-Path $DBTemp -ChildPath "Viewstate.raw-$($this.Timestamp)"
+        if (!$this.RunSQLCommand("""$Source"" "".output '$RawDump'"" "".dump metadata_item_settings metadata_item_views""", "Failed to export viewstate from '$Source'")) {
+            return $false
+        }
+
+        $ViewstateSQL = Join-Path $DBTemp -ChildPath "Viewstate.sql-$($this.Timestamp)"
+        Get-Content -Path $RawDump | Where-Object { ($_ -cnotmatch 'TABLE') -and ($_ -cnotmatch 'INDEX') } | Set-Content -Path $ViewstateSQL -Encoding UTF8
+
+        $Inserts = @(Get-Content -Path $ViewstateSQL | Where-Object { $_ -match '^INSERT ' }).Count
+        if ($Inserts -lt 1) {
+            $this.Output("No viewstates or history found to import.")
+            $this.WriteLog($this.StageLog("Nothing to import - FAIL"))
+            return $false
+        }
+
+        # Work on a copy of our main DB so the live database is untouched until we've verified the result
+        $this.Output("Preparing to import Viewstate and History data")
+        $MainPath = Join-Path $this.PlexDBDir -ChildPath $this.MainDB
+        $Working = Join-Path $DBTemp -ChildPath "$($this.MainDB)-IMPORT-$($this.Timestamp)"
+        try {
+            Copy-Item -Path $MainPath -Destination $Working -Force -EA Stop
+        } catch {
+            $this.OutputWarn("Error making a working copy of the main database: $($Error -join "`n")")
+            $this.WriteLog($this.StageLog("Prepare working copy - FAIL"))
+            $Error.Clear()
+            return $false
+        }
+
+        $this.ApplyPageSize($Working)
+
+        # Import the rows, tolerating constraint (duplicate) errors - feed via stdin so SQLite keeps going
+        $this.Output("Importing Viewstate & History data...")
+        try {
+            $Proc = Start-Process $this.PlexSQL -ArgumentList @("""$Working""") -RedirectStandardInput $ViewstateSQL -NoNewWindow -Wait -PassThru -EA Stop
+            $Proc.WaitForExit()
+        } catch {
+            $this.OutputWarn("Error importing viewstate data: $($Error -join "`n")")
+            $this.WriteLog($this.StageLog("Import data - FAIL"))
+            $Error.Clear()
+            return $false
+        }
+
+        # Remove any duplicate settings that slipped through (keep the earliest row per guid+account)
+        $Dedup = "DELETE FROM metadata_item_settings WHERE rowid NOT IN (SELECT MIN(rowid) FROM metadata_item_settings GROUP BY guid, account_id);"
+        $this.RunSQLCommand("""$Working"" ""$Dedup""", "Failed to remove duplicate settings") | Out-Null
+
+        $this.Output("Checking database following import")
+        if (!$this.CheckDBIntegrity($Working, "imported main")) {
+            $this.OutputWarn("Database is corrupted after import. Discarding import attempt.")
+            $this.WriteLog($this.StageLog("Import: $Source - FAIL"))
+            Remove-Item $Working -Force -EA Ignore
+            return $false
+        }
+
+        if (!$this.CheckPMS("import")) { return $false }
+
+        # Swap the imported database in, keeping the previous one as a persistent backup
+        try {
+            $this.MoveDatabase($MainPath, (Join-Path $this.PlexDBDir -ChildPath "$($this.MainDB)-BACKUP-$($this.Timestamp)"), "back up Main DB")
+            $this.MoveDatabase($Working, $MainPath, "install imported Main DB")
+        } catch {
+            $Error.Clear()
+            return $false
+        }
+
+        $this.SetLast("Import", $this.Timestamp)
+        $this.CheckedDB = $true
+        $this.DBDamaged = $false
+        $this.ExitDBMaintenance("Viewstate import successful.", $true)
+        return $true
+    }
+
+    ### Self-update (mirrors DBRepair.sh DownloadAndUpdate) ###
+
+    # URL of the canonical Windows script on the master branch.
+    [string] WindowsScriptUrl() {
+        return "https://raw.githubusercontent.com/ChuckPa/DBRepair/master/Windows/DBRepair-Windows.ps1"
+    }
+
+    # Fetch the version string from the latest published Windows script, or $null on failure.
+    [string] GetLatestWindowsVersion() {
+        try {
+            $Text = (Invoke-WebRequest -Uri $this.WindowsScriptUrl() -UseBasicParsing -EA Stop).Content
+        } catch {
+            $Error.Clear()
+            return $null
+        }
+
+        if ($Text -match "\`$DBRepairVersion\s*=\s*'(v[\d.]+)'") {
+            return $Matches[1]
+        }
+        return $null
+    }
+
+    # Compare two 'vX.Y.Z' version strings, returning whether $Candidate is newer than $Current.
+    [bool] IsNewerVersion([string] $Candidate, [string] $Current) {
+        try {
+            return ([version]($Candidate -replace '^v', '')) -gt ([version]($Current -replace '^v', ''))
+        } catch {
+            $Error.Clear()
+            return $false
+        }
+    }
+
+    # Download the latest script over the current one, keeping a '.bak'. Returns success.
+    [bool] DownloadAndUpdate([string] $Url, [string] $Path) {
+        $Tmp = "$Path.tmp"
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $Tmp -UseBasicParsing -EA Stop
+        } catch {
+            $this.OutputWarn("Download failed: $($Error -join "`n")")
+            $Error.Clear()
+            Remove-Item $Tmp -Force -EA Ignore
+            return $false
+        }
+
+        if (!$this.FileExists($Tmp) -or (Get-Item $Tmp).Length -lt 10000) {
+            $this.OutputWarn("Downloaded file is incomplete.")
+            Remove-Item $Tmp -Force -EA Ignore
+            return $false
+        }
+
+        try {
+            Copy-Item -Path $Path -Destination "$Path.bak" -Force -EA Stop
+            Move-Item -Path $Tmp -Destination $Path -Force -EA Stop
+        } catch {
+            $this.OutputWarn("Could not replace the script file: $($Error -join "`n")")
+            $Error.Clear()
+            Remove-Item $Tmp -Force -EA Ignore
+            return $false
+        }
+
+        return $true
+    }
+
+    # Check for and optionally install a newer version of the Windows script (the 'update' command).
+    [void] DoUpdate() {
+        $this.WriteLog($this.StageLog("START"))
+        $this.Output("Checking for update")
+
+        $Latest = $this.GetLatestWindowsVersion()
+        if (!$Latest) {
+            $this.OutputWarn("Could not determine the latest version. Check your network connection.")
+            $this.WriteLog($this.StageLog("FAIL - could not fetch latest version"))
+            return
+        }
+
+        if (!$this.IsNewerVersion($Latest, $this.Version)) {
+            $this.Output("No update available. (current $($this.Version), latest $Latest)")
+            $this.WriteLog($this.StageLog("PASS - up to date"))
+            return
+        }
+
+        if (!$this.ScriptPath -or !$this.FileExists($this.ScriptPath)) {
+            $this.OutputWarn("Update available ($Latest), but the script path is unknown. Please update manually.")
+            $this.WriteLog($this.StageLog("Update available but path unknown"))
+            return
+        }
+
+        if (!($this.Options.Scripted -or $this.GetYesNo("Download $Latest and update?"))) {
+            return
+        }
+
+        $this.Output("Updating from $($this.Version) to $Latest")
+        if ($this.DownloadAndUpdate($this.WindowsScriptUrl(), $this.ScriptPath)) {
+            $this.Output("Update complete. Restart DBRepair-Windows to use $Latest. (previous saved as .bak)")
+            $this.WriteLog($this.StageLog("PASS - updated to $Latest"))
+        } else {
+            $this.WriteLog($this.StageLog("FAIL - download failed"))
+        }
     }
 
     # Return whether we can continue DB repair (i.e. whether PMS is running) at the given stage in the process.
@@ -1829,7 +2134,7 @@ $InputEncodingSave = [console]::InputEncoding
 $OutputEncodingSave = [console]::OutputEncoding
 [console]::InputEncoding = [console]::OutputEncoding = New-Object System.Text.UTF8Encoding
 
-[void]([DBRepair]::new($args, $DBRepairVersion))
+[void]([DBRepair]::new($args, $DBRepairVersion, $PSCommandPath))
 
 [console]::OutputEncoding = $OutputEncodingSave
 [console]::InputEncoding = $InputEncodingSave

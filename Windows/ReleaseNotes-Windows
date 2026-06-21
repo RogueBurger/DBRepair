@@ -4,6 +4,11 @@ Release notes for the Windows counterpart to DBRepair.sh (DBRepair-Windows.ps1)
 
 # Release Info
 
+v1.02.03
+  - Add `import` command to merge watch history from another database (interactive)
+  - Add `update` command to self-update the script from GitHub
+  - Honor the `DBREPAIR_PAGESIZE` environment variable when rebuilding databases
+
 v1.02.02
   - Add `replace` command to restore the databases from a saved backup (Plex's nightly backups or
     this tool's own), with integrity checking before swapping

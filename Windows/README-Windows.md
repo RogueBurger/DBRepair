@@ -30,6 +30,7 @@ AUTO(matic)
 CHEC(k)
 DEFL(ate)
 EXIT
+IMPO(rt)
 PRUN(e)
 REIN(dex)
 REPA(ir)
@@ -39,6 +40,7 @@ STAR(t)
 STAT(us)
 STOP
 UNDO
+UPDA(te)
 VACU(um)
 ```
 
