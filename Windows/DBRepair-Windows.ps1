@@ -3,7 +3,7 @@
 #                                                                       #
 #########################################################################
 
-$DBRepairVersion = 'v1.02.01'
+$DBRepairVersion = 'v1.02.02'
 
 class DBRepair {
     [DBRepairOptions] $Options
@@ -104,11 +104,13 @@ class DBRepair {
         Write-Host
         Write-Host "  7 - 'start'     - Start PMS"
         Write-Host
+        Write-Host "  9 - 'replace'   - Replace current databases with a saved backup (interactive)."
         Write-Host " 10 - 'show'      - Show logfile."
         Write-Host " 11 - 'status'    - Report status of PMS (run-state and databases)."
         Write-Host " 12 - 'undo'      - Undo last successful command."
         Write-Host
-        Write-Host " 21 - 'prune'     - Prune (remove) old image files (jpeg,jpg,png) from PhotoTranscoder cache."
+        Write-Host " 21 - 'prune'     - Prune old image files from PhotoTranscoder cache & PMS temp files."
+        Write-Host " 23 - 'deflate'   - Deflate a bloated PMS main database."
         if ($this.Options.IgnoreErrors) {
             Write-Host " 42 - 'honor'     - Honor all database errors."
         } else {
@@ -240,6 +242,10 @@ class DBRepair {
                     $this.IsError = !$this.DoReindex()
                 }
                 "^(7|start?)$" { $this.StartPMS() }
+                "^(9|repl(a(c(e)?)?)?)$" {
+                    $this.SetStage("Replace")
+                    $this.DoReplace()
+                }
                 "^(10|show)$" { $this.DoShow() }
                 "^(11|stat(us?)?)$" { $this.DoStatus() }
                 "^(12|undo)$" {
@@ -249,6 +255,10 @@ class DBRepair {
                 "^(21|(prune?|remov?e?))$" {
                     $this.SetStage("Prune")
                     $this.PrunePhotoTranscoderCache()
+                }
+                "^(23|defl(a(t(e)?)?)?)$" {
+                    $this.SetStage("Deflate")
+                    $this.IsError = !$this.DoDeflate()
                 }
                 "^(42|ignor?e?|honor?)$" {
                     if (($this.Options.IgnoreErrors -and ($Choice[0] -eq 'i')) -or (!$this.Options.IgnoreErrors -and ($Choice[0] -eq 'h'))) {
@@ -842,6 +852,304 @@ class DBRepair {
         return $false
     }
 
+    # Return the dated backup tokens that have a matching main + blobs pair, newest first.
+    # Discovers both Plex's nightly '-YYYY-MM-DD' backups and this tool's '-BACKUP-<timestamp>' sets.
+    [string[]] GetDates() {
+        $Prefix = "$($this.MainDB)-"
+        $Candidates = @()
+        Get-ChildItem -Path $this.PlexDBDir -Filter "$($this.MainDB)-*" -File -EA Ignore | ForEach-Object {
+            $Token = $_.Name.Substring($Prefix.Length)
+            if ($Token -match '^\d{4}-\d{2}-\d{2}' -or $Token -match '^BACKUP-') {
+                $Blobs = Join-Path $this.PlexDBDir -ChildPath "$($this.BlobsDB)-$Token"
+                if ($this.FileExists($Blobs)) { $Candidates += $Token }
+            }
+        }
+
+        return @($Candidates | Sort-Object -Descending -Unique)
+    }
+
+    # Replace the current databases with a previously saved backup (interactive 'replace' command).
+    [void] DoReplace() {
+        $this.WriteLog($this.StageLog("START"))
+        if (!$this.CheckPMS("replace")) { return }
+
+        if ($this.Options.Scripted) {
+            $this.OutputWarn("'replace' requires interactive backup selection and cannot run in scripted mode.")
+            $this.WriteLog($this.StageLog("Skipped - scripted mode"))
+            return
+        }
+
+        # If the databases are healthy, make the user confirm they really want to roll back
+        $Healthy = $this.CheckDatabases($true)
+        if ($Healthy -and !$this.GetYesNo("Databases appear OK. Are you sure you want to restore a previous backup")) {
+            $this.Output("Replace cancelled.")
+            return
+        }
+
+        $Dates = $this.GetDates()
+        if ($Dates.Count -eq 0) {
+            if (!$Healthy) {
+                $this.Output("Databases are damaged and no backups are available. The only option is 'repair' (5).")
+            } else {
+                $this.Output("No database backups available to restore.")
+            }
+            $this.WriteLog($this.StageLog("Scan for usable candidates - FAIL"))
+            return
+        }
+
+        if (!$this.FreeSpaceAvailable(3)) {
+            $this.OutputWarn("Insufficient free space to replace (need $($this.SpaceNeeded) MB, have $($this.SpaceAvailable) MB).")
+            $this.WriteLog($this.StageLog("FAIL - Insufficient free space"))
+            return
+        }
+
+        $this.Output("")
+        $this.Output("Database backups available:")
+        for ($i = 0; $i -lt $Dates.Count; $i++) {
+            $this.Output("  $($i + 1)) - $($Dates[$i])")
+        }
+        $this.Output("")
+        $Selection = Read-Host "Select backup by number or name (blank = return to menu)"
+        if (!$Selection) { return }
+
+        $Candidate = $null
+        for ($i = 0; $i -lt $Dates.Count; $i++) {
+            if (($Selection -eq ($i + 1).ToString()) -or ($Selection -eq $Dates[$i])) {
+                $Candidate = $Dates[$i]
+                break
+            }
+        }
+        if (!$Candidate) {
+            $this.Output("No matching backup. Nothing replaced.")
+            $this.WriteLog($this.StageLog("Select candidate - FAIL"))
+            return
+        }
+
+        $CandMain = Join-Path $this.PlexDBDir -ChildPath "$($this.MainDB)-$Candidate"
+        $CandBlobs = Join-Path $this.PlexDBDir -ChildPath "$($this.BlobsDB)-$Candidate"
+        if (!$this.FileExists($CandMain) -or !$this.FileExists($CandBlobs)) {
+            $this.Output("One of the backup files is missing. Please make another selection.")
+            return
+        }
+
+        $this.Output("Checking backup candidate $Candidate")
+        if (!$this.CheckDBIntegrity($CandMain, "backup main") -or !$this.CheckDBIntegrity($CandBlobs, "backup blobs")) {
+            $this.Output("Backup from $Candidate is not usable. Please try another.")
+            $this.WriteLog($this.StageLog("Candidate $Candidate - FAIL"))
+            return
+        }
+        $this.Output("Database backup $Candidate is valid.")
+
+        if (!$this.GetYesNo("Use backup dated '$Candidate'")) {
+            $this.Output("Replace cancelled.")
+            return
+        }
+
+        # Move the live databases aside (persistent, undoable), then copy the backup into place
+        $this.Output("Saving current databases with '-BACKUP-$($this.Timestamp)' timestamp.")
+        try {
+            $this.BackupLiveByMove()
+        } catch {
+            $Error.Clear()
+            return
+        }
+
+        $MainPath = Join-Path $this.PlexDBDir -ChildPath $this.MainDB
+        $BlobsPath = Join-Path $this.PlexDBDir -ChildPath $this.BlobsDB
+        $ReplaceMain = Join-Path $this.PlexDBDir -ChildPath "$($this.MainDB)-REPLACE-$($this.Timestamp)"
+        $ReplaceBlobs = Join-Path $this.PlexDBDir -ChildPath "$($this.BlobsDB)-REPLACE-$($this.Timestamp)"
+
+        $Fail = $false
+        try {
+            Copy-Item -Path $CandMain -Destination $ReplaceMain -Force -EA Stop
+            Copy-Item -Path $CandBlobs -Destination $ReplaceBlobs -Force -EA Stop
+        } catch {
+            $this.OutputWarn("Error copying backup databases: $($Error -join "`n")")
+            $Error.Clear()
+            $Fail = $true
+        }
+
+        if (!$Fail) {
+            $this.Output("Copy complete. Performing final check.")
+            if ($this.CheckDBIntegrity($ReplaceMain, "restored main") -and $this.CheckDBIntegrity($ReplaceBlobs, "restored blobs")) {
+                try {
+                    $this.MoveDatabase($ReplaceMain, $MainPath, "install restored Main DB")
+                    $this.MoveDatabase($ReplaceBlobs, $BlobsPath, "install restored Blobs DB")
+                } catch {
+                    $Error.Clear()
+                    $Fail = $true
+                }
+            } else {
+                $this.Output("Final check failed. Keeping existing databases.")
+                $this.WriteLog($this.StageLog("Verify restored databases - FAIL"))
+                Remove-Item $ReplaceMain, $ReplaceBlobs -Force -EA Ignore
+                $Fail = $true
+            }
+        }
+
+        if ($Fail) {
+            $this.Output("Replace failed. Restoring original databases.")
+            $this.RestoreSaved($this.Timestamp)
+            $this.WriteLog($this.StageLog("FAIL"))
+            return
+        }
+
+        $this.SetLast("Replace", $this.Timestamp)
+        $this.CheckedDB = $true
+        $this.DBDamaged = $false
+        $this.ExitDBMaintenance("Database recovery and verification complete.", $true)
+    }
+
+    # The two-pass SQL used by deflate: rebuild the bloated statistics_bandwidth table.
+    [string] DeflateSQL() {
+        return @"
+BEGIN IMMEDIATE;
+DROP TABLE IF EXISTS temp_bandwidth;
+CREATE TABLE temp_bandwidth (
+  id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+  account_id INTEGER,
+  device_id INTEGER,
+  timespan INTEGER,
+  at INTEGER,
+  lan INTEGER,
+  bytes INTEGER
+);
+INSERT INTO temp_bandwidth (account_id, device_id, timespan, at, lan, bytes)
+  SELECT account_id, device_id, timespan, at, COALESCE(lan, 0), bytes
+  FROM statistics_bandwidth WHERE account_id not null;
+DROP TABLE statistics_bandwidth;
+ALTER TABLE temp_bandwidth RENAME TO statistics_bandwidth;
+CREATE INDEX IF NOT EXISTS index_statistics_bandwidth_on_at ON statistics_bandwidth(at);
+CREATE INDEX IF NOT EXISTS index_statistics_bandwidth_on_account_id_and_timespan_and_at ON statistics_bandwidth(account_id, timespan, at);
+COMMIT;
+"@
+    }
+
+    # Deflate a bloated main database: repair statistics_bandwidth, then VACUUM into a compact copy.
+    [bool] DoDeflate() {
+        $this.Output("Deflate of main database started.")
+        $this.WriteLog($this.StageLog("START"))
+
+        if (!$this.CheckPMS("deflate")) { return $false }
+
+        if (!$this.FreeSpaceAvailable(3)) {
+            $this.OutputWarn("Insufficient free space to deflate (need $($this.SpaceNeeded) MB, have $($this.SpaceAvailable) MB).")
+            $this.WriteLog($this.StageLog("FAIL - Insufficient free space"))
+            return $false
+        }
+
+        $MainPath = Join-Path $this.PlexDBDir -ChildPath $this.MainDB
+        if (!$this.FileExists($MainPath)) {
+            $this.ExitDBMaintenance("No main Plex database exists to deflate.", $false)
+            return $false
+        }
+        if ((Get-Item $MainPath).Length -lt 300000) {
+            $this.ExitDBMaintenance("Main database is too small/truncated, deflate is not possible. Try restoring a backup.", $false)
+            return $false
+        }
+
+        $DBTemp = $this.EnsureDBTemp()
+        if (!$DBTemp) { return $false }
+
+        if (!$this.MakeBackups()) {
+            $this.WriteLog($this.StageLog("MakeBackups - FAIL"))
+            return $false
+        }
+        $this.WriteLog($this.StageLog("MakeBackups - PASS"))
+
+        $BackupMain = Join-Path $this.PlexDBDir -ChildPath "$($this.MainDB)-BACKUP-$($this.Timestamp)"
+
+        # Part 1: rebuild the statistics_bandwidth table on the backup copy
+        $this.Output("Starting Deflate (Part 1 of 2 - Repair statistics_bandwidth table)")
+        $SqlFile = Join-Path $DBTemp -ChildPath "deflate.sql_$($this.Timestamp)"
+        Set-Content -Path $SqlFile -Value $this.DeflateSQL() -Encoding UTF8
+        if (!$this.RunSQLCommand("""$BackupMain"" "".read '$SqlFile'""", "Failed to rebuild statistics_bandwidth table")) {
+            return $false
+        }
+
+        # Part 2: vacuum the repaired database into a fresh, compacted file
+        $this.Output("Starting Deflate (Part 2 of 2 - Reduce size)")
+        $DeflateMain = Join-Path $DBTemp -ChildPath "$($this.MainDB)-DEFLATE-$($this.Timestamp)"
+        if (!$this.RunSQLCommand("""$BackupMain"" ""VACUUM main into '$DeflateMain'""", "Failed to vacuum (deflate) main database")) {
+            return $false
+        }
+
+        $this.Output("Verifying deflated database.")
+        if (!$this.CheckDBIntegrity($DeflateMain, "deflated main")) {
+            $this.ExitDBMaintenance("Deflated database failed verification. No files changed.", $false)
+            return $false
+        }
+
+        $StartSize = $this.GetSizeMB($MainPath)
+        $FinishSize = $this.GetSizeMB($DeflateMain)
+
+        if (!$this.CheckPMS("deflate")) { return $false }
+
+        # Swap: keep the bloated original aside, install the deflated database
+        $this.Output("Saving current main database with '-BLOATED-$($this.Timestamp)'")
+        try {
+            $this.MoveDatabase($MainPath, (Join-Path $this.PlexDBDir -ChildPath "$($this.MainDB)-BLOATED-$($this.Timestamp)"), "set aside bloated Main DB")
+            $this.MoveDatabase($DeflateMain, $MainPath, "install deflated Main DB")
+        } catch {
+            $Error.Clear()
+            return $false
+        }
+
+        # Remove stale wal/shm so the new database starts clean
+        foreach ($Suffix in @("db-wal", "db-shm", "blobs.db-wal", "blobs.db-shm")) {
+            $f = Join-Path $this.PlexDBDir -ChildPath "$($this.BaseName).$Suffix"
+            if ($this.FileExists($f)) { Remove-Item $f -Force -EA Ignore }
+        }
+
+        $this.SetLast("Deflate", $this.Timestamp)
+        $this.CheckedDB = $true
+        $this.DBDamaged = $false
+        $this.WriteOutputLog("PMS main database reduced from $StartSize MB to $FinishSize MB")
+        $this.ExitDBMaintenance("Deflate completed.", $true)
+        return $true
+    }
+
+    # Return the PMS transcode scratch directory (sibling of PhotoTranscoder), or $null if not found.
+    [string] GetTranscodeTempDir() {
+        if (!$this.PlexCache) { return $null }
+        $Transcode = Join-Path (Split-Path -Parent $this.PlexCache) -ChildPath "Transcode"
+        if ($this.DirExists($Transcode)) { return $Transcode }
+        return $null
+    }
+
+    # Remove stale temp files PMS leaves behind in its transcode directory ('pms-*' entries and
+    # stray images older than a day). Scoped to the PMS-owned Transcode cache only.
+    [void] PrunePmsTempFiles() {
+        $Transcode = $this.GetTranscodeTempDir()
+        if (!$Transcode) { return }
+
+        $Cutoff = (Get-Date).AddDays(-1)
+        $Items = @(Get-ChildItem -Path $Transcode -Recurse -EA Ignore | Where-Object {
+            ($_.LastWriteTime -lt $Cutoff) -and (($_.Name -like 'pms-*') -or ($_.Extension -in '.jpg', '.jpeg', '.png'))
+        })
+
+        if ($Items.Count -eq 0) {
+            $this.Output("No stale PMS transcode temp files found.")
+            return
+        }
+
+        if (!($this.Options.Scripted -or $this.GetYesNo("OK to remove $($Items.Count) stale PMS transcode temp file(s)"))) {
+            $this.WriteOutputLog($this.StageLog("Temp file prune cancelled by user"))
+            return
+        }
+
+        $Removed = 0
+        foreach ($Item in $Items) {
+            try {
+                Remove-Item $Item.FullName -Recurse -Force -EA Stop
+                $Removed++
+            } catch {
+                $Error.Clear()
+            }
+        }
+        $this.WriteOutputLog($this.StageLog("Removed $Removed PMS transcode temp file(s)"))
+    }
+
     # Return whether we can continue DB repair (i.e. whether PMS is running) at the given stage in the process.
     [bool] CheckPMS([string] $SubStage) {
         if ($this.PMSRunning()) {
@@ -902,6 +1210,9 @@ class DBRepair {
         } else {
             $this.WriteOutputLog($this.StageLog("Prune cancelled by user"))
         }
+
+        # Also clear stale temp files PMS leaves behind in its transcode directory
+        $this.PrunePmsTempFiles()
 
         $this.WriteLog($this.StageLog("PASS"))
     }

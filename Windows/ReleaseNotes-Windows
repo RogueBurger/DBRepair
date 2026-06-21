@@ -4,6 +4,12 @@ Release notes for the Windows counterpart to DBRepair.sh (DBRepair-Windows.ps1)
 
 # Release Info
 
+v1.02.02
+  - Add `replace` command to restore the databases from a saved backup (Plex's nightly backups or
+    this tool's own), with integrity checking before swapping
+  - Add `deflate` command to shrink a bloated main database
+  - `prune` now also removes stale PMS temp files from the transcode cache
+
 v1.02.01
   - Add Full-Text Search index checking and rebuild, folded into `check`, `reindex`, and `automatic`
   - Report FTS status in `status`
