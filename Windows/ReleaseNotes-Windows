@@ -4,6 +4,13 @@ Release notes for the Windows counterpart to DBRepair.sh (DBRepair-Windows.ps1)
 
 # Release Info
 
+v1.02.00
+  - Add `check`, `vacuum`, `repair`, `reindex`, `show`, `status`, and `undo` commands
+  - Keep persistent timestamped backups so the last successful operation can be undone
+  - Add free-space checks before destructive operations
+  - `automatic` now checks the databases first and stops if they're damaged
+  - Fix Plex SQLite path typos in the registry fallback
+
 v1.01.02
   - Remove `statistics_bandwidth` pruning, as it's now part of PMS 1.41.8
   - Change `quit` to 98 and `exit` to 99
