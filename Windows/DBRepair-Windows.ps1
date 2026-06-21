@@ -3,7 +3,7 @@
 #                                                                       #
 #########################################################################
 
-$DBRepairVersion = 'v1.02.00'
+$DBRepairVersion = 'v1.02.01'
 
 class DBRepair {
     [DBRepairOptions] $Options
@@ -31,6 +31,11 @@ class DBRepair {
     # Database health flags (set by CheckDatabases, reported by status)
     [bool]   $CheckedDB  # Whether the databases have been integrity-checked this session
     [bool]   $DBDamaged  # Whether the last integrity check found damage
+
+    # FTS (Full-Text Search) index health flags (tracked separately - FTS can be damaged
+    # even when PRAGMA integrity_check passes)
+    [bool]   $CheckedFTS # Whether the FTS indexes have been checked this session
+    [bool]   $FTSDamaged # Whether the last FTS check found damage
 
     DBRepair($Arguments, $Version) {
         $this.Options = [DBRepairOptions]::new()
@@ -91,7 +96,7 @@ class DBRepair {
         Write-Host $Header
         Write-Host
         Write-Host "  1 - 'stop'      - Stop PMS."
-        Write-Host "  2 - 'automatic' - Check, Repair/Optimize, and Reindex Database in one step."
+        Write-Host "  2 - 'automatic' - Check, Repair/Optimize, Reindex, and FTS rebuild in one step."
         Write-Host "  3 - 'check'     - Perform integrity check of databases."
         Write-Host "  4 - 'vacuum'    - Remove empty space from databases without optimizing."
         Write-Host "  5 - 'repair'    - Repair/Optimize databases."
@@ -393,7 +398,7 @@ class DBRepair {
             return $false
         }
 
-        # Reindex
+        # Reindex (DoReindex also checks and rebuilds FTS as its final step)
         $this.UpdateTimestamp()
         $this.SetStage("Reindex")
         if (!$this.DoReindex()) {
@@ -403,7 +408,7 @@ class DBRepair {
         }
 
         $this.WriteLog("Auto    - COMPLETED")
-        $this.Output("Automatic Check, Repair/Optimize, & Index successful.")
+        $this.Output("Automatic Check, Repair/Optimize, Index, & FTS check successful.")
         return $true
     }
 
@@ -534,7 +539,12 @@ class DBRepair {
         }
 
         $this.SetLast("Reindex", $this.Timestamp)
-        $this.ExitDBMaintenance("Reindex complete.", $true)
+        $this.WriteOutputLog("Reindex complete.")
+        $this.WriteLog($this.StageLog("PASS"))
+
+        # Check FTS indexes and rebuild if damaged (does not affect reindex success)
+        $this.Output("")
+        $this.EnsureFTS() | Out-Null
         return $true
     }
 
@@ -581,7 +591,7 @@ class DBRepair {
         return $true
     }
 
-    # Integrity-check both databases (standalone 'check' command).
+    # Integrity-check both databases and their FTS indexes (standalone 'check' command).
     [void] DoCheck() {
         $this.WriteLog($this.StageLog("START"))
         if (!$this.CheckPMS("check")) { return }
@@ -591,6 +601,14 @@ class DBRepair {
         } else {
             $this.WriteLog($this.StageLog("FAIL"))
             $this.Output("One or more databases are damaged. Use 'repair' (5) or 'replace' (9).")
+        }
+
+        # FTS indexes can be damaged even when the integrity check passes
+        $this.Output("")
+        if (!$this.CheckFTS()) {
+            $this.Output("")
+            $this.Output("NOTE: FTS indexes are damaged but the main database structure may be OK.")
+            $this.Output("      Use 'reindex' (6) or 'automatic' (2) to rebuild.")
         }
     }
 
@@ -619,6 +637,14 @@ class DBRepair {
             $this.Output("  Databases are OK.")
         } else {
             $this.Output("  Databases were checked and are damaged.")
+        }
+
+        if (!$this.CheckedFTS) {
+            $this.Output("  FTS indexes are not checked. Status unknown.")
+        } elseif (!$this.FTSDamaged) {
+            $this.Output("  FTS indexes are OK.")
+        } else {
+            $this.Output("  FTS indexes are damaged.")
         }
 
         if ($this.LastTimestamp) {
@@ -669,6 +695,151 @@ class DBRepair {
         $this.WriteLog($this.StageLog("Undo $($this.LastName), TimeStamp $($this.LastTimestamp)"))
         $this.SetLast("Undo", "")
         $this.CheckedDB = $false
+        $this.CheckedFTS = $false
+    }
+
+    ### FTS (Full-Text Search) helpers (mirrors DBRepair.sh CheckFTS/DoFTSRebuild) ###
+
+    # Query that lists FTS4 virtual tables, excluding their shadow tables.
+    [string] FTSTableQuery() {
+        return "SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%fts4%'" +
+            " AND name NOT LIKE '%_content' AND name NOT LIKE '%_segments'" +
+            " AND name NOT LIKE '%_segdir' AND name NOT LIKE '%_stat'" +
+            " AND name NOT LIKE '%_docsize' ORDER BY name;"
+    }
+
+    # Return the FTS4 table names in the given database (empty array if none or on error).
+    [string[]] GetFTSTables([string] $DBPath) {
+        $Result = ""
+        if (!$this.TryRunSQL("""$DBPath"" ""$($this.FTSTableQuery())""", [ref]$Result)) { return @() }
+        return @($Result) | ForEach-Object { "$_".Trim() } | Where-Object { $_ }
+    }
+
+    # Check FTS index integrity across both databases, updating CheckedFTS/FTSDamaged.
+    # Returns $true if all FTS indexes are OK.
+    [bool] CheckFTS() {
+        $this.Output("Checking FTS (Full-Text Search) indexes")
+        $FTSFail = $false
+
+        foreach ($db in @(@($this.MainDB, ""), @($this.BlobsDB, " (blobs)"))) {
+            $DBPath = Join-Path $this.PlexDBDir -ChildPath $db[0]
+            $Label = $db[1]
+            if (!$this.FileExists($DBPath)) { continue }
+
+            $Tables = $this.GetFTSTables($DBPath)
+            if ($Tables.Count -eq 0) {
+                if (!$Label) { $this.Output("No FTS4 tables found in main database.") }
+                continue
+            }
+
+            foreach ($Table in $Tables) {
+                $Out = ""
+                $OK = $this.TryRunSQL("""$DBPath"" ""INSERT INTO $Table($Table) VALUES('integrity-check');""", [ref]$Out)
+                if ($OK -and !$Out) {
+                    $this.Output("  FTS index '$Table'$Label - OK")
+                    $this.WriteLog($this.StageLog("FTS Check: $Table - PASS"))
+                } else {
+                    $this.Output("  FTS index '$Table'$Label - DAMAGED")
+                    if ($Out) { $this.Output("    Error: $Out") }
+                    $this.WriteLog($this.StageLog("FTS Check: $Table - FAIL"))
+                    $FTSFail = $true
+                }
+            }
+        }
+
+        $this.CheckedFTS = $true
+        $this.FTSDamaged = $FTSFail
+        if (!$FTSFail) {
+            $this.Output("FTS integrity check complete. All FTS indexes OK.")
+            $this.WriteLog($this.StageLog("FTS Check - PASS"))
+        } else {
+            $this.Output("FTS integrity check complete. One or more FTS indexes are DAMAGED.")
+            $this.Output("Use 'reindex' (6) or 'automatic' (2) to rebuild.")
+            $this.WriteLog($this.StageLog("FTS Check - FAIL"))
+        }
+
+        return !$FTSFail
+    }
+
+    # Rebuild the FTS indexes across both databases. Makes an undoable backup, restores it on failure.
+    [bool] DoFTSRebuild() {
+        $this.Output("FTS index rebuild started.")
+        $this.WriteLog($this.StageLog("START"))
+
+        if (!$this.CheckPMS("FTS rebuild")) { return $false }
+
+        # FTS corruption can pass integrity_check, so a damaged main DB doesn't necessarily block us.
+        if (!$this.CheckDatabases($false)) {
+            $this.OutputWarn("Database integrity check failed.")
+            $this.Output("FTS rebuild may still help if the corruption is isolated to FTS indexes.")
+            if (!($this.Options.Scripted -or $this.GetYesNo("Continue with FTS rebuild anyway"))) {
+                $this.Output("FTS rebuild cancelled.")
+                return $false
+            }
+        }
+
+        if (!$this.MakeBackups()) {
+            $this.WriteLog($this.StageLog("MakeBackup - FAIL"))
+            return $false
+        }
+        $this.WriteLog($this.StageLog("MakeBackup - PASS"))
+
+        $Fail = $false
+        foreach ($db in @(@($this.MainDB, ""), @($this.BlobsDB, " (blobs)"))) {
+            $DBPath = Join-Path $this.PlexDBDir -ChildPath $db[0]
+            $Label = $db[1]
+            if (!$this.FileExists($DBPath)) { continue }
+
+            $Tables = $this.GetFTSTables($DBPath)
+            if ($Tables.Count -eq 0) { continue }
+
+            foreach ($Table in $Tables) {
+                $this.Output("  Rebuilding $Table$Label...")
+                $Out = ""
+                $OK = $this.TryRunSQL("""$DBPath"" ""INSERT INTO $Table($Table) VALUES('rebuild');""", [ref]$Out)
+                if ($OK) {
+                    $this.Output("    $Table rebuilt successfully.")
+                    $this.WriteLog($this.StageLog("Rebuild$($Label): $Table - PASS"))
+                } elseif ($this.Options.IgnoreErrors) {
+                    $this.OutputWarn("Ignoring rebuild error for $Table$Label.")
+                    $this.WriteLog($this.StageLog("Rebuild$($Label): $Table - IGNORED"))
+                } else {
+                    $this.Output("    $Table rebuild failed. $Out")
+                    $this.WriteLog($this.StageLog("Rebuild$($Label): $Table - FAIL"))
+                    $Fail = $true
+                }
+            }
+        }
+
+        if (!$Fail) {
+            $this.SetLast("FTSRbld", $this.Timestamp)
+            $this.FTSDamaged = $false
+            $this.ExitDBMaintenance("FTS rebuild complete.", $true)
+            return $true
+        }
+
+        $this.Output("Some FTS indexes failed to rebuild. Restoring backup.")
+        $this.RestoreSaved($this.Timestamp)
+        $this.WriteLog($this.StageLog("FAIL"))
+        return $false
+    }
+
+    # Check the FTS indexes and rebuild them if damaged. Returns $true if FTS ends up healthy.
+    # FTS failures do not fail the calling operation (the main DB work has already succeeded).
+    [bool] EnsureFTS() {
+        if ($this.CheckFTS()) { return $true }
+
+        $this.Output("")
+        $this.Output("FTS indexes are damaged. Attempting FTS rebuild...")
+        $this.UpdateTimestamp()
+        $this.SetStage("FTSRbld")
+        if ($this.DoFTSRebuild()) {
+            $this.Output("FTS rebuild successful.")
+            return $true
+        }
+
+        $this.OutputWarn("FTS rebuild failed. You may need to run 'reindex' (6) manually.")
+        return $false
     }
 
     # Return whether we can continue DB repair (i.e. whether PMS is running) at the given stage in the process.
@@ -1169,6 +1340,33 @@ class DBRepair {
             $Output.Value = $SqlResult
         }
 
+        return $true
+    }
+
+    # Run a 'Plex SQLite' command quietly, capturing combined output. Unlike RunSQLCommand this
+    # does no logging or error reporting - it just returns whether the command succeeded, so callers
+    # (e.g. FTS checks) can decide what to do. $Output receives stdout on success or the error on failure.
+    [bool] TryRunSQL([string] $Command, [ref] $Output) {
+        $SqlError = $null
+        $SqlResult = $null
+        $ExitCode = 0
+        try {
+            Invoke-Expression "& ""$($this.PlexSQL)"" $Command" -ev sqlError -OutVariable sqlResult -EA Stop *>$null
+            $ExitCode = $LASTEXITCODE
+        } catch {
+            $Output.Value = ($Error -join "`n")
+            $Error.Clear()
+            return $false
+        }
+
+        if ($SqlError -or $ExitCode) {
+            $Err = $SqlError -join "`n"
+            if (!$Err) { $Err = "Process exited with error code $ExitCode" }
+            $Output.Value = $Err
+            return $false
+        }
+
+        $Output.Value = $SqlResult
         return $true
     }
 

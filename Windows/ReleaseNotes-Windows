@@ -4,6 +4,10 @@ Release notes for the Windows counterpart to DBRepair.sh (DBRepair-Windows.ps1)
 
 # Release Info
 
+v1.02.01
+  - Add Full-Text Search index checking and rebuild, folded into `check`, `reindex`, and `automatic`
+  - Report FTS status in `status`
+
 v1.02.00
   - Add `check`, `vacuum`, `repair`, `reindex`, `show`, `status`, and `undo` commands
   - Keep persistent timestamped backups so the last successful operation can be undone
