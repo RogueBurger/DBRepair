@@ -27,10 +27,21 @@ The following commands (or their number) are currently supported on Windows.
 
 ```
 AUTO(matic)
+CHEC(k)
+DEFL(ate)
 EXIT
+IMPO(rt)
 PRUN(e)
+REIN(dex)
+REPA(ir)
+REPL(ace)
+SHOW
 STAR(t)
+STAT(us)
 STOP
+UNDO
+UPDA(te)
+VACU(um)
 ```
 
 Run `.\DBRepair-Windows.ps1 -Help` for more complete documentation.

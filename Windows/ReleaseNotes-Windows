@@ -4,6 +4,28 @@ Release notes for the Windows counterpart to DBRepair.sh (DBRepair-Windows.ps1)
 
 # Release Info
 
+v1.02.03
+  - Add `import` command to merge watch history from another database (interactive)
+  - Add `update` command to self-update the script from GitHub
+  - Honor the `DBREPAIR_PAGESIZE` environment variable when rebuilding databases
+
+v1.02.02
+  - Add `replace` command to restore the databases from a saved backup (Plex's nightly backups or
+    this tool's own), with integrity checking before swapping
+  - Add `deflate` command to shrink a bloated main database
+  - `prune` now also removes stale PMS temp files from the transcode cache
+
+v1.02.01
+  - Add Full-Text Search index checking and rebuild, folded into `check`, `reindex`, and `automatic`
+  - Report FTS status in `status`
+
+v1.02.00
+  - Add `check`, `vacuum`, `repair`, `reindex`, `show`, `status`, and `undo` commands
+  - Keep persistent timestamped backups so the last successful operation can be undone
+  - Add free-space checks before destructive operations
+  - `automatic` now checks the databases first and stops if they're damaged
+  - Fix Plex SQLite path typos in the registry fallback
+
 v1.01.02
   - Remove `statistics_bandwidth` pruning, as it's now part of PMS 1.41.8
   - Change `quit` to 98 and `exit` to 99
