@@ -3,7 +3,7 @@
 #                                                                       #
 #########################################################################
 
-$DBRepairVersion = 'v1.02.03'
+$DBRepairVersion = 'v1.02.04'
 
 class DBRepair {
     [DBRepairOptions] $Options
@@ -1313,10 +1313,14 @@ COMMIT;
 
         $this.ApplyPageSize($Working)
 
-        # Import the rows, tolerating constraint (duplicate) errors - feed via stdin so SQLite keeps going
+        # Import the rows, tolerating constraint (duplicate) errors - feed via stdin so SQLite keeps
+        # going. Redirect its output to files so the (expected) per-row constraint errors don't spam
+        # the console; we rely on the post-import integrity check to judge success.
         $this.Output("Importing Viewstate & History data...")
+        $ImportOut = Join-Path $DBTemp -ChildPath "import.out-$($this.Timestamp)"
+        $ImportErr = Join-Path $DBTemp -ChildPath "import.err-$($this.Timestamp)"
         try {
-            $Proc = Start-Process $this.PlexSQL -ArgumentList @("""$Working""") -RedirectStandardInput $ViewstateSQL -NoNewWindow -Wait -PassThru -EA Stop
+            $Proc = Start-Process $this.PlexSQL -ArgumentList @("""$Working""") -RedirectStandardInput $ViewstateSQL -RedirectStandardOutput $ImportOut -RedirectStandardError $ImportErr -NoNewWindow -Wait -PassThru -EA Stop
             $Proc.WaitForExit()
         } catch {
             $this.OutputWarn("Error importing viewstate data: $($Error -join "`n")")
@@ -1339,13 +1343,21 @@ COMMIT;
 
         if (!$this.CheckPMS("import")) { return $false }
 
-        # Swap the imported database in, keeping the previous one as a persistent backup
+        # Install the imported database. The previous one is already preserved by MakeBackups above
+        # (as '-BACKUP-<timestamp>'), so we just replace the live file and clear its stale wal/shm.
         try {
-            $this.MoveDatabase($MainPath, (Join-Path $this.PlexDBDir -ChildPath "$($this.MainDB)-BACKUP-$($this.Timestamp)"), "back up Main DB")
+            if ($this.FileExists($MainPath)) { Remove-Item $MainPath -Force -EA Stop }
             $this.MoveDatabase($Working, $MainPath, "install imported Main DB")
         } catch {
+            $this.OutputWarn("Error installing imported database: $($Error -join "`n")")
+            $this.WriteLog($this.StageLog("Install imported database - FAIL"))
             $Error.Clear()
             return $false
+        }
+
+        foreach ($Suffix in @("db-wal", "db-shm")) {
+            $f = Join-Path $this.PlexDBDir -ChildPath "$($this.BaseName).$Suffix"
+            if ($this.FileExists($f)) { Remove-Item $f -Force -EA Ignore }
         }
 
         $this.SetLast("Import", $this.Timestamp)

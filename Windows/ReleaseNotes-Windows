@@ -4,6 +4,10 @@ Release notes for the Windows counterpart to DBRepair.sh (DBRepair-Windows.ps1)
 
 # Release Info
 
+v1.02.04
+  - Fix `import` failing during the final database swap, and silence the expected
+    duplicate-row errors it printed while merging
+
 v1.02.03
   - Add `import` command to merge watch history from another database (interactive)
   - Add `update` command to self-update the script from GitHub
